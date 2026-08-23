@@ -321,7 +321,7 @@ Build with:
 .venv/bin/python -m PyInstaller --clean --noconfirm video_sorter.spec
 ```
 
-The spec creates a one-directory bundle at `dist/video_sorter/`. Copy the whole directory, including `_internal`. PyInstaller builds for the current operating system and CPU architecture, so create the production Windows executable on Windows rather than copying a macOS build.
+The spec creates a one-directory bundle at `dist/video_sorter/`. Copy the whole directory, including `_internal`. PyInstaller builds for the current operating system and CPU architecture, so create the production Windows executable on Windows rather than copying a macOS build. The repository's **Windows build** GitHub Actions workflow is the supported fallback when the deployment PC does not have a build toolchain; it runs the test suite before publishing a zipped Windows bundle and SHA-256 checksum.
 
 The build does not contain `config.ini`, `.env`, or a schedule workbook. The executable reads those files relative to its working directory. A Windows service or scheduled task therefore needs its working directory set to the deployment folder.
 

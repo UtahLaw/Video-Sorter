@@ -1,0 +1,57 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "**.py"
+      - requirements.txt
+      - test_courses.xlsx
+      - video_sorter.spec
+      - .github/workflows/windows-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build the Windows bundle
+        run: python -m PyInstaller --clean --noconfirm video_sorter.spec
+
+      - name: Package the complete one-directory bundle
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\video_sorter\* -DestinationPath video_sorter-windows-x64.zip
+          $hash = (Get-FileHash video_sorter-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  video_sorter-windows-x64.zip" | Set-Content video_sorter-windows-x64.sha256
+
+      - name: Upload the Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-sorter-windows-x64
+          path: |
+            video_sorter-windows-x64.zip
+            video_sorter-windows-x64.sha256
+          if-no-files-found: error
+          retention-days: 30

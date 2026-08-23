@@ -97,7 +97,9 @@ Build with:
 
 PyInstaller produces `dist/video_sorter/`. Keep that whole directory together; the executable depends on its `_internal` contents.
 
-Builds are platform-specific. The macOS arm64 build runs only on Apple silicon Macs. Build the Windows executable on the Windows deployment machine. `config.ini`, `.env`, and the schedule workbook are not bundled. Start the executable with its working directory set to the folder containing those files.
+Builds are platform-specific. The macOS arm64 build runs only on Apple silicon Macs. For Windows, either build on a Windows machine or run the repository's **Windows build** GitHub Actions workflow. The workflow tests the release, builds it with Python 3.11, and publishes `video-sorter-windows-x64`, containing the complete zipped bundle and a SHA-256 checksum.
+
+`config.ini`, `.env`, and the schedule workbook are intentionally not bundled. Start the executable with its working directory set to the folder containing those files.
 
 ## Schedule spreadsheet expectations
 
