@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: Check out the release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
           cache: pip
@@ -33,11 +33,26 @@ jobs:
       - name: Install pinned dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Create an isolated test configuration
+        shell: pwsh
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP "video-sorter-tests"
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+          Set-Content -Path config.ini -Value @("[Paths]", "test_folder = $testRoot")
+
       - name: Run tests
         run: python -m pytest -q
 
       - name: Build the Windows bundle
         run: python -m PyInstaller --clean --noconfirm video_sorter.spec
+
+      - name: Smoke test the packaged executable
+        shell: pwsh
+        run: |
+          & ".\dist\video_sorter\video_sorter.exe" --validate-schedule ".\test_courses.xlsx"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged schedule validation failed with exit code $LASTEXITCODE"
+          }
 
       - name: Package the complete one-directory bundle
         shell: pwsh
@@ -47,7 +62,7 @@ jobs:
           "$hash  video_sorter-windows-x64.zip" | Set-Content video_sorter-windows-x64.sha256
 
       - name: Upload the Windows release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: video-sorter-windows-x64
           path: |
