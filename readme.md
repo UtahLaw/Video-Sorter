@@ -17,25 +17,30 @@ The sorter depends on three local inputs:
 
 For `Upload` mode it also needs a repo-root `.env` file with Kaltura credentials.
 
+A sanitized schedule workbook example is available at [docs/examples/course_schedule_example.xlsx](docs/examples/course_schedule_example.xlsx), with field notes in [docs/COURSE_SHEET_INPUT.md](docs/COURSE_SHEET_INPUT.md).
+
 ## Setup
 
 ### 1. Create a virtual environment
 
+Use Python 3.11 for the current pinned dependency set and executable builds.
+
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 ```
 
 ### 2. Install dependencies
 
 ```bash
+.venv/bin/python -m ensurepip --upgrade
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Note: the current `requirements.txt` file is UTF-16LE encoded.
+`requirements.txt` is UTF-8. It pins `setuptools==79.0.1` because the current PyInstaller and altgraph versions still import `pkg_resources`, which newer setuptools releases removed.
 
 ### 3. Create `config.ini`
 
-Use `config-EXAMPLE.ini` as a reference, but do not copy the inline comments on the same line as values. With the current Python `ConfigParser` usage, those inline comments become part of the value.
+Use `config-EXAMPLE.ini` as a reference. The app now supports inline config comments, but the example keeps explanatory comments on their own lines to stay easy to copy and audit.
 
 ### 4. Add `.env` if using upload mode
 
@@ -55,6 +60,14 @@ These values should stay local and never be committed.
 
 The app processes immediately on first launch, then continues running and checks again when the local time reaches 3 AM.
 
+For a controlled one-pass test, run:
+
+```bash
+.venv/bin/python video_sorter.py --run-once
+```
+
+This uses the mode and folders in `config.ini`, processes one batch, runs retention cleanup, and exits.
+
 ## Running Tests
 
 Run:
@@ -68,10 +81,9 @@ The tests depend on:
 - `test_courses.xlsx`
 - the folder structure configured by `[Paths].test_folder`
 
-Status verified locally on April 21, 2026:
+Status verified locally on August 23, 2026:
 
-- 17 tests passed
-- 1 test failed because it hard-codes a Windows-style path expectation and does not pass on macOS/Linux
+- 45 tests passed
 
 ## Build To Executable
 
@@ -80,26 +92,41 @@ The repo includes `video_sorter.spec`.
 Build with:
 
 ```bash
-.venv/bin/pyinstaller video_sorter.spec
+.venv/bin/python -m PyInstaller --clean --noconfirm video_sorter.spec
 ```
 
-## Schedule Spreadsheet Expectations
+PyInstaller produces `dist/video_sorter/`. Keep that whole directory together; the executable depends on its `_internal` contents.
 
-The current importer expects columns including:
+Builds are platform-specific. The macOS arm64 build runs only on Apple silicon Macs. Build the Windows executable on the Windows deployment machine. `config.ini`, `.env`, and the schedule workbook are not bundled. Start the executable with its working directory set to the folder containing those files.
+
+## Schedule spreadsheet expectations
+
+The importer accepts extra columns and any column order. It ignores capitalization and extra whitespace in known headers. These columns are required:
 
 - `Course`
 - `Section #`
 - `Course Title`
-- `Meeting Pattern`
 - `Instructor LAST`
-- `Room (cleaned)`
 - `Instructor`
+
+The workbook also needs at least one meeting column, `Meetings` or `Meeting Pattern`, and at least one room column, `Room (cleaned)` or `Room`.
 
 Operational notes:
 
-- `Room (cleaned)` should contain the bare room number
-- `Meeting Pattern` needs to contain recognizable day/time text
-- `Instructor` is parsed using a strict `LAST, FIRST (00123456)` pattern
+- Room values may be bare numbers or building-prefixed values such as `LAW 2100` and `GC 3700`.
+- `ONLINE`, `CANVAS`, `No Meeting Pattern`, and other nonphysical values do not participate in room/time matching.
+- Semicolon-delimited meeting segments may have different days, times, rooms, and date limits.
+- If one room value is listed, the importer applies it to every meeting segment. If the number of room values equals the number of meeting segments, it maps them by order, including mixed physical and nonphysical meetings. Other multi-room layouts or partly malformed room lists generate an error and disable timed matching for the whole row.
+- `Instructor` uses `LAST, FIRST (00123456)`. Bracketed role labels such as `[Primary Instructor]` are allowed. Separate multiple instructors with semicolons.
+- When more than one start time falls inside the tolerance window, the matcher only considers the nearest one. Equal-distance rows with the same upload hosts use stable course and section order. Equal-distance rows with different hosts leave recordings in the watch folder for review.
+
+Check a workbook without moving or uploading anything:
+
+```bash
+.venv/bin/python video_sorter.py --validate-schedule /path/to/course_schedule.xlsx
+```
+
+Operational startup also stops before moving or uploading files when the schedule has an invalid room mapping. Upload mode additionally stops when a physical timed course has no valid upload host.
 
 ## Supported Recording Sources
 
@@ -116,4 +143,3 @@ Details and examples live in [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md).
 - Support unscheduled/manual recordings that start with one or more uNIDs
 - Make config examples safer and more copy-pasteable
 - Reduce Windows-only assumptions in tests and docs
-- Make spreadsheet and instructor parsing more defensive

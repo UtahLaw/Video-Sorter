@@ -1,4 +1,5 @@
 virtual
+.venv
 build
 dist
 .env
@@ -6,3 +7,11 @@ config.ini
 log.txt
 .pytest_cache
 __pycache__
+.DS_Store
+outputs/
+automatedtests/
+
+# Real registrar exports should stay local. Keep sanitized fixtures in docs/examples/.
+Sp*_courses.xlsx
+Su*_courses.xlsx
+Fa*_courses.xlsx

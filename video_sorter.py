@@ -1,6 +1,7 @@
 
 import os
 import re
+import argparse
 from time import sleep
 import logging
 import logging.handlers
@@ -14,94 +15,505 @@ from format_parser import *
 from collections.abc import Callable
 from file_reaper import reap_files
 
+MEETING_START_TIME_PATTERN = re.compile(r'\b\d{1,2}:\d{2}(?:am|pm)\b|\b\d{1,2}(?:am|pm)\b', re.IGNORECASE)
+MEETING_DAY_PATTERN = re.compile(r'TTh|Th|Su|Sa|M|T|W|F')
+MEETING_DATE_PATTERN = re.compile(
+    r'\((\d{1,2}/\d{1,2}/\d{4})(?:\s+to\s+(\d{1,2}/\d{1,2}/\d{4}))?\)',
+    re.IGNORECASE,
+)
+MEETING_DAY_MAP = {
+    'M': {'Monday'},
+    'T': {'Tuesday'},
+    'W': {'Wednesday'},
+    'Th': {'Thursday'},
+    'TTh': {'Tuesday', 'Thursday'},
+    'F': {'Friday'},
+    'Sa': {'Saturday'},
+    'Su': {'Sunday'},
+}
+SCHEDULE_COLUMNS = {
+    'Course',
+    'Section #',
+    'Course Title',
+    'Meeting Pattern',
+    'Meetings',
+    'Instructor LAST',
+    'Room (cleaned)',
+    'Instructor',
+    'Room',
+}
+REQUIRED_SCHEDULE_COLUMNS = {
+    'Course',
+    'Section #',
+    'Course Title',
+    'Instructor LAST',
+    'Instructor',
+}
+NONPHYSICAL_ROOMS = {
+    '',
+    'canvas',
+    'does not meet',
+    'no meeting pattern',
+    'no room',
+    'online',
+    'tba',
+    'tbd',
+}
+
 # Reading paths from config.ini
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
 config.read('config.ini')
 
-RECORDING_START_TOLERANCE = timedelta(minutes=config.getint('Settings', 'start_time_tolerance'))
-   
-# Read course details from the Excel sheet into the global 'courses' list
-def read_courses(excel_path) -> list[Course]:
-    """
-    Reads a list of courses from an excel file and parses them to Course objects. 
-    For an example of how this excel file should look, see test_courses.xlsx
-    """
-    courses: list[Course] = []
-    df = pd.read_excel(excel_path)
-    df = df.dropna(how='all')
-    for index, row in df.iterrows():
-        instructor = str(row['Instructor LAST']).replace(' & ', ' ') if pd.notna(row['Instructor LAST']) else ''
-        days_pattern = re.findall(r'M|TTh|T|W|F|Sa', str(row['Meeting Pattern']))
-        days = set()  # Define the days list here
-        for day_pattern in days_pattern:
-            if day_pattern == 'M':
-                days.add('Monday')
-            elif day_pattern == 'TTh':
-                days.add('Tuesday')
-                days.add('Thursday')
-            elif day_pattern == 'T':
-                days.add('Tuesday')
-            elif day_pattern == 'W':
-                days.add('Wednesday')
-            elif day_pattern == 'F':
-                days.add('Friday')
-            elif day_pattern == 'Sa':
-                days.add('Saturday')
-
-        start_time = None
-
-        # Extract time pattern from the correct column (modify as needed)
-        time_pattern = str(row['Meeting Pattern'])
-
-        # Correctly parse start time
-        start_time_str = re.search(r'\b\d{1,2}:\d{2}(?:am|pm)\b|\b\d{1,2}(?:am|pm)\b', time_pattern, re.IGNORECASE)
-        if start_time_str:
-            start_time_str = start_time_str.group()
-            start_time_str = start_time_str.replace('am', 'AM').replace('pm', 'PM')
-            start_time = datetime.strptime(start_time_str, '%I:%M%p' if ':' in start_time_str else '%I%p').time()
-        else:
-            logging.info(f"Invalid start time found for course {row['Course']}. Skipping.")
-
-        instructors = []
-        instructorStrings = row['Instructor'].split('; ')
-        for s in instructorStrings:
-            instructorMatch = re.search(r'([^(),\d]+),\s*([^()\d]+)\s+\((\d{8})\);*\s*', s)
-            groups = instructorMatch.groups()
-            instructors.append(EventHost(groups[1], groups[0], groups[2]))
+RECORDING_START_TOLERANCE = timedelta(
+    minutes=config.getint('Settings', 'start_time_tolerance', fallback=30)
+)
 
 
-        # Extract and store the section number
-        section_number = row['Section #'] if pd.notna(row['Section #']) else None
+class ScheduleFormatError(ValueError):
+    """Raised when a schedule workbook does not have a usable schema."""
 
-        course = Course(
-            row['Course'],
-            str(section_number),
-            row['Course Title'],
-            instructor,
-            str(row['Room (cleaned)']),
-            days,
-            start_time,
-            instructors
+
+def _is_blank_cell(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _cell_text(value) -> str:
+    if _is_blank_cell(value):
+        return ''
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _normalized_header(value) -> str:
+    return re.sub(r'\s+', ' ', str(value).replace('\ufeff', '')).strip().casefold()
+
+
+def normalize_schedule_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Map known headers case-insensitively while rejecting ambiguous schemas."""
+    canonical_by_normalized = {_normalized_header(column): column for column in SCHEDULE_COLUMNS}
+    rename_map = {}
+    matched_sources: dict[str, object] = {}
+
+    for source_column in df.columns:
+        canonical = canonical_by_normalized.get(_normalized_header(source_column))
+        if canonical is None:
+            continue
+        if canonical in matched_sources:
+            first_source = matched_sources[canonical]
+            raise ScheduleFormatError(
+                f"Schedule spreadsheet has two columns that both map to '{canonical}': "
+                f"'{first_source}' and '{source_column}'. Remove or rename one of them."
+            )
+        matched_sources[canonical] = source_column
+        rename_map[source_column] = canonical
+
+    available = ', '.join(repr(str(column)) for column in df.columns)
+    missing = sorted(REQUIRED_SCHEDULE_COLUMNS - set(matched_sources))
+    if missing:
+        missing_text = ', '.join(missing)
+        raise ScheduleFormatError(
+            f"Schedule spreadsheet is missing required column(s): {missing_text}. "
+            f"Available columns: {available}"
+        )
+    if not {'Meeting Pattern', 'Meetings'} & set(matched_sources):
+        raise ScheduleFormatError(
+            "Schedule spreadsheet needs either 'Meeting Pattern' or 'Meetings'. "
+            f"Available columns: {available}"
+        )
+    if not {'Room (cleaned)', 'Room'} & set(matched_sources):
+        raise ScheduleFormatError(
+            "Schedule spreadsheet needs either 'Room (cleaned)' or 'Room'. "
+            f"Available columns: {available}"
         )
 
+    return df.rename(columns=rename_map)
+
+def parse_meeting_days(meeting_pattern: str) -> set[str]:
+    days: set[str] = set()
+
+    for segment in str(meeting_pattern).split(';'):
+        start_time_match = MEETING_START_TIME_PATTERN.search(segment)
+        if start_time_match is None:
+            continue
+
+        day_text = segment[:start_time_match.start()].strip()
+        position = 0
+        while position < len(day_text):
+            if day_text[position].isspace():
+                position += 1
+                continue
+
+            token_match = MEETING_DAY_PATTERN.match(day_text, position)
+            if token_match is None:
+                break
+
+            days.update(MEETING_DAY_MAP[token_match.group()])
+            position = token_match.end()
+
+    return days
+
+def parse_start_time(meeting_pattern: str) -> time | None:
+    start_time_match = MEETING_START_TIME_PATTERN.search(str(meeting_pattern))
+    if start_time_match is None:
+        return None
+
+    start_time_str = start_time_match.group().replace('am', 'AM').replace('pm', 'PM')
+    return datetime.strptime(start_time_str, '%I:%M%p' if ':' in start_time_str else '%I%p').time()
+
+
+def parse_meeting_date_range(meeting_text: str) -> tuple[date | None, date | None]:
+    date_match = MEETING_DATE_PATTERN.search(str(meeting_text))
+    if date_match is None:
+        return None, None
+
+    start_text, end_text = date_match.groups()
+    start_date = datetime.strptime(start_text, '%m/%d/%Y').date()
+    end_date = datetime.strptime(end_text, '%m/%d/%Y').date() if end_text else start_date
+    return start_date, end_date
+
+
+def parse_course_meetings(meeting_text: str) -> list[CourseMeeting]:
+    meetings = []
+    for raw_segment in str(meeting_text).split(';'):
+        segment = raw_segment.strip()
+        if segment == '':
+            continue
+        days = parse_meeting_days(segment)
+        start_time = parse_start_time(segment)
+        start_date, end_date = parse_meeting_date_range(segment)
+        meetings.append(CourseMeeting(days, start_time, None, start_date, end_date, segment))
+    return meetings
+
+
+def _is_nonphysical_room(room_text: str) -> bool:
+    normalized = re.sub(r'\s+', ' ', room_text).strip().casefold()
+    return normalized in NONPHYSICAL_ROOMS
+
+
+def normalize_room_number(raw_room) -> str | None:
+    """Return the room number from a registrar room value when unambiguous."""
+    text = _cell_text(raw_room)
+    if _is_nonphysical_room(text):
+        return None
+
+    if re.fullmatch(r'\d{3,5}', text):
+        return text
+    numeric_excel_value = re.fullmatch(r'(\d{3,5})\.0+', text)
+    if numeric_excel_value is not None:
+        return numeric_excel_value.group(1)
+
+    building_room = re.fullmatch(
+        r"(?:\d+\s*-\s*)?[A-Za-z][A-Za-z .&'/-]*\s+(\d{3,5})",
+        text,
+    )
+    if building_room is not None:
+        return building_room.group(1)
+    return None
+
+
+def parse_room_numbers(raw_room) -> tuple[list[str | None], list[str]]:
+    rooms: list[str | None] = []
+    invalid_values = []
+    text = _cell_text(raw_room)
+    if text == '':
+        return rooms, invalid_values
+
+    for value in re.split(r'\s*(?:;|\r?\n)\s*', text):
+        value = value.strip()
+        if value == '':
+            continue
+        if _is_nonphysical_room(value):
+            # Keep the placeholder so mixed physical/nonphysical room lists can
+            # still be mapped positionally to their meeting segments.
+            rooms.append(None)
+            continue
+        room_number = normalize_room_number(value)
+        if room_number is None:
+            invalid_values.append(value)
+        else:
+            rooms.append(room_number)
+    return rooms, invalid_values
+
+def parse_instructors(raw_instructors, course_number: str, section_number: str) -> list[EventHost]:
+    instructors: list[EventHost] = []
+    seen_unids = set()
+
+    if pd.isna(raw_instructors):
+        logging.warning(f"Course {course_number}-{section_number} is missing instructor data. Upload mode will leave matching files in place.")
+        return instructors
+
+    instructor_strings = str(raw_instructors).split(';')
+    for instructor_string in instructor_strings:
+        instructor_string = instructor_string.strip()
+        if instructor_string == '':
+            continue
+
+        instructor_string = re.sub(r'(?:\s*\[[^\]]+\]\s*)+$', '', instructor_string).strip()
+
+        instructor_match = re.fullmatch(r'([^(),\d]+),\s*([^()\d]+)\s+\((\d{8})\);*', instructor_string)
+        if instructor_match is None:
+            logging.warning(f"Could not parse instructor '{instructor_string}' for course {course_number}-{section_number}. Upload mode will leave matching files in place.")
+            continue
+
+        last_name, first_name, unid = instructor_match.groups()
+        if unid in seen_unids:
+            continue
+        seen_unids.add(unid)
+        instructors.append(EventHost(first_name.strip(), last_name.strip(), unid))
+
+    return instructors
+   
+def _course_label(course: Course) -> str:
+    return f'{course.number}-{course.section_number}'
+
+
+def _natural_sort_key(value: str) -> tuple:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r'(\d+)', str(value))
+        if part != ''
+    )
+
+
+def _course_sort_key(course: Course) -> tuple:
+    return (
+        _natural_sort_key(course.number),
+        _natural_sort_key(course.section_number),
+        course.name.casefold(),
+        course.instructor_last.casefold(),
+    )
+
+
+def _host_set(course: Course) -> frozenset[str]:
+    return frozenset(host.unid for host in course.hosts)
+
+
+def _date_ranges_overlap(
+    first: CourseMeeting,
+    second: CourseMeeting,
+    weekday: str | None = None,
+) -> bool:
+    first_start = first.start_date or date.min
+    first_end = first.end_date or date.max
+    second_start = second.start_date or date.min
+    second_end = second.end_date or date.max
+    overlap_start = max(first_start, second_start)
+    overlap_end = min(first_end, second_end)
+    if overlap_start > overlap_end:
+        return False
+    if weekday is None:
+        return True
+
+    weekday_number = WEEKDAYS.index(weekday)
+    days_until_weekday = (weekday_number - overlap_start.weekday()) % 7
+    return overlap_start + timedelta(days=days_until_weekday) <= overlap_end
+
+
+def validate_courses(courses: list[Course]) -> list[str]:
+    """Return actionable warnings for duplicate physical schedule slots."""
+    slots: dict[tuple[str, str, time], list[tuple[Course, CourseMeeting]]] = {}
+    for course in courses:
+        for meeting in course.meetings:
+            if meeting.room_number is None or meeting.start_time is None:
+                continue
+            for day in meeting.days:
+                key = (meeting.room_number, day, meeting.start_time)
+                slots.setdefault(key, []).append((course, meeting))
+
+    conflicts: dict[tuple[int, int, str, time], tuple[Course, Course, set[str]]] = {}
+    for (room_number, day, start_time), entries in slots.items():
+        for index, (first_course, first_meeting) in enumerate(entries):
+            for second_course, second_meeting in entries[index + 1:]:
+                if first_course is second_course or not _date_ranges_overlap(first_meeting, second_meeting, day):
+                    continue
+                key = (id(first_course), id(second_course), room_number, start_time)
+                if key not in conflicts:
+                    conflicts[key] = (first_course, second_course, set())
+                conflicts[key][2].add(day)
+
+    issues = []
+    for (_, _, room_number, start_time), (first, second, days) in conflicts.items():
+        day_text = ', '.join(day for day in WEEKDAYS if day in days)
+        candidates = f'{_course_label(first)} and {_course_label(second)}'
+        if _host_set(first) and _host_set(first) == _host_set(second):
+            chosen = min((first, second), key=_course_sort_key)
+            policy = f'They have the same upload host(s), so the matcher will choose {_course_label(chosen)} by stable course and section order and log a warning.'
+        else:
+            policy = 'They do not have the same upload hosts, so recordings in this slot will stay in the watch folder for review.'
+        issues.append(
+            f'Duplicate schedule slot in room {room_number} on {day_text} at '
+            f'{start_time.strftime("%I:%M %p")}: {candidates}. {policy}'
+        )
+    return issues
+
+
+# Read course details from the Excel sheet into the global 'courses' list
+def read_courses(excel_path, log_validation: bool = True) -> list[Course]:
+    """
+    Reads a list of courses from an excel file and parses them to Course objects. 
+    For examples of how this excel file should look, see test_courses.xlsx and
+    docs/examples/course_schedule_example.xlsx.
+    """
+    courses: list[Course] = []
+    df = normalize_schedule_headers(pd.read_excel(excel_path)).dropna(how='all')
+    for index, row in df.iterrows():
+        spreadsheet_row = index + 2
+        course_number = _cell_text(row['Course'])
+        if course_number == '':
+            raise ScheduleFormatError(f'Schedule spreadsheet row {spreadsheet_row} has a blank Course value.')
+        instructor = str(row['Instructor LAST']).replace(' & ', ' ') if pd.notna(row['Instructor LAST']) else ''
+        section_number = _cell_text(row['Section #'])
+        if section_number == '':
+            raise ScheduleFormatError(f'Schedule spreadsheet row {spreadsheet_row} has a blank Section # value.')
+
+        row_validation_errors = []
+
+        detailed_meetings = _cell_text(row['Meetings']) if 'Meetings' in df.columns else ''
+        meeting_pattern = _cell_text(row['Meeting Pattern']) if 'Meeting Pattern' in df.columns else ''
+        meeting_source = detailed_meetings or meeting_pattern
+        meetings = parse_course_meetings(meeting_source)
+
+        cleaned_room = row['Room (cleaned)'] if 'Room (cleaned)' in df.columns else None
+        raw_room = row['Room'] if 'Room' in df.columns else None
+        if _is_blank_cell(cleaned_room):
+            rooms, invalid_rooms = parse_room_numbers(raw_room)
+        else:
+            rooms, invalid_rooms = parse_room_numbers(cleaned_room)
+        if invalid_rooms and not _is_blank_cell(raw_room) and not _is_blank_cell(cleaned_room):
+            fallback_rooms, fallback_invalid = parse_room_numbers(raw_room)
+            if fallback_rooms and not fallback_invalid:
+                rooms = fallback_rooms
+                invalid_rooms = []
+        if invalid_rooms:
+            error_message = (
+                f"Could not safely parse room value(s) {invalid_rooms!r} for {course_number}-{section_number} "
+                f'on spreadsheet row {spreadsheet_row}. Timed matching will skip this row.'
+            )
+            logging.error(error_message)
+            row_validation_errors.append(error_message)
+            # Never infer a mapping from the valid subset of a malformed room
+            # list. That can assign one known room to the wrong segment.
+            rooms = []
+
+        if len(rooms) == 1:
+            for meeting in meetings:
+                meeting.room_number = rooms[0]
+        elif len(rooms) == len(meetings) and len(rooms) > 1:
+            for meeting, room_number in zip(meetings, rooms):
+                meeting.room_number = room_number
+        elif len(rooms) > 1:
+            error_message = (
+                f'Cannot safely map {len(rooms)} rooms to {len(meetings)} meeting segments for '
+                f'{course_number}-{section_number} on spreadsheet row {spreadsheet_row}. '
+                'Timed matching will skip this row.'
+            )
+            logging.error(error_message)
+            row_validation_errors.append(error_message)
+
+        is_nonmeeting_row = meeting_source.strip().casefold().startswith('does not meet')
+        if not is_nonmeeting_row and not any(meeting.start_time is not None for meeting in meetings):
+            logging.warning(
+                f"Could not parse a start time for course {course_number}-{section_number} from "
+                f"meeting text '{meeting_source}'. Room/time matching will skip this course."
+            )
+        instructors = parse_instructors(row['Instructor'], course_number, section_number)
+
+        first_meeting = meetings[0] if meetings else CourseMeeting(set(), None, None)
+
+        course = Course(
+            course_number,
+            section_number,
+            _cell_text(row['Course Title']),
+            instructor,
+            first_meeting.room_number,
+            first_meeting.days,
+            first_meeting.start_time,
+            instructors,
+            meetings,
+        )
+        course.validation_errors.extend(row_validation_errors)
+
         courses.append(course)
-        
+
+    if log_validation:
+        for issue in validate_courses(courses):
+            logging.warning(issue)
+
     return courses
 
-def find_course_by_number_and_section(courses: list[Course], rec: LectureRecording) -> Course:
+def _resolve_course_candidates(
+    candidates: list[Course],
+    rec: LectureRecording,
+    match_description: str,
+) -> Course | None:
+    if len(candidates) == 0:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    candidates = sorted(candidates, key=_course_sort_key)
+    candidate_text = ', '.join(_course_label(course) for course in candidates)
+    host_sets = {_host_set(course) for course in candidates}
+    if len(host_sets) == 1 and next(iter(host_sets)):
+        chosen = candidates[0]
+        logging.warning(
+            f'Multiple courses match {match_description}: {candidate_text}. They have the same '
+            f'upload host(s), so {_course_label(chosen)} was chosen by stable course and section order.'
+        )
+        return chosen
+
+    rec.matching_error = (
+        f'Multiple courses with different or missing upload hosts match {match_description}: '
+        f'{candidate_text}'
+    )
+    logging.error(f'{rec.matching_error}. Leaving {rec.filename} in the watch folder for review.')
+    return None
+
+
+def _course_allows_date_limited_recording(course: Course, recording_date: date | None) -> bool:
+    if recording_date is None:
+        return True
+    date_limited_meetings = [meeting for meeting in course.meetings if meeting.has_date_limit]
+    if not date_limited_meetings:
+        return True
+
+    recording_weekday = WEEKDAYS[recording_date.weekday()]
+    for meeting in course.meetings:
+        if meeting.start_date is not None and recording_date < meeting.start_date:
+            continue
+        if meeting.end_date is not None and recording_date > meeting.end_date:
+            continue
+        if meeting.days and recording_weekday not in meeting.days:
+            continue
+        if meeting.has_date_limit or meeting.days:
+            return True
+    return False
+
+
+def find_course_by_number_and_section(courses: list[Course], rec: LectureRecording) -> Course | None:
     """
     Finds the course in the list whose number and section matches the 
     one in the given recording object
     """
     logging.debug(f"Searching for {rec} by course number and section")
 
-    # Iterate through the courses list and look for a match
-    for course in courses:
-        if course.number == rec.course_number_full() and course.section_number == rec.section_number:
-            return course
-
-    # Return None if no match is found
-    return None
+    candidates = [
+        course for course in courses
+        if course.number == rec.course_number_full()
+        and course.section_number == rec.section_number
+        and _course_allows_date_limited_recording(course, rec.date)
+    ]
+    return _resolve_course_candidates(
+        candidates,
+        rec,
+        f'course number {rec.course_number_full()} and section {rec.section_number}',
+    )
 
 def parse_recording_file(filepath: str) -> LectureRecording:
     """
@@ -120,38 +532,54 @@ def parse_recording_file(filepath: str) -> LectureRecording:
     
     return LectureRecording(filepath, None, None, None, None)
 
-def find_course_by_room_and_datetime(courses: list[Course], rec: LectureRecording) -> Course:
+def _meeting_match_distance(meeting: CourseMeeting, rec: LectureRecording) -> int | None:
+    if rec.time is None or rec.date is None:
+        return None
+    if meeting.room_number is None or meeting.start_time is None or not meeting.days:
+        return None
+    if meeting.room_number != normalize_room_number(rec.room_number):
+        return None
+    if not meeting.occurs_on(rec.date):
+        return None
+
+    course_minutes = meeting.start_time.hour * 60 + meeting.start_time.minute
+    recording_minutes = rec.time.hour * 60 + rec.time.minute
+    distance = abs(course_minutes - recording_minutes)
+    tolerance_minutes = int(RECORDING_START_TOLERANCE.total_seconds() // 60)
+    return distance if distance <= tolerance_minutes else None
+
+
+def find_course_by_room_and_datetime(courses: list[Course], rec: LectureRecording) -> Course | None:
     """
     Finds the course in the given list which has a matching room, 
     date and time to the given recording
     """
     logging.debug(f'Trying to match {rec} by room and datetime')
 
-    # Iterate through the courses and look for a match
+    candidates_with_distance = []
     for course in courses:
-        # Check for room match
-        if course.room_number != rec.room_number:
-            continue
-            
-        if rec.time is None:
-            continue
+        distances = [
+            distance
+            for meeting in course.meetings
+            if (distance := _meeting_match_distance(meeting, rec)) is not None
+        ]
+        if distances:
+            candidates_with_distance.append((min(distances), course))
 
-        weekdays = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        recording_weekday = rec.date.weekday()
+    if not candidates_with_distance:
+        return None
 
-        if weekdays[recording_weekday] not in course.days:
-            continue
-
-        # Check if the file's datetime is within a tolerance window around the course start time
-        tolerance = RECORDING_START_TOLERANCE
-        course_datetime_no_date = datetime(2023, 1, 1, course.start_time.hour, course.start_time.minute)
-        rec_datetime_no_date = datetime(2023, 1, 1, rec.time.hour, rec.time.minute)
-        window_start = course_datetime_no_date - tolerance
-        window_end = course_datetime_no_date + tolerance
-        if window_start <= rec_datetime_no_date and rec_datetime_no_date <= window_end:
-            return course
-    
-    return None
+    nearest_distance = min(distance for distance, _ in candidates_with_distance)
+    candidates = [
+        course for distance, course in candidates_with_distance
+        if distance == nearest_distance
+    ]
+    return _resolve_course_candidates(
+        candidates,
+        rec,
+        f'room {rec.room_number} on {rec.date} at {rec.time} '
+        f'({nearest_distance} minute(s) from the nearest scheduled start)',
+    )
 
 def determine_semester(date: date):
     """
@@ -284,6 +712,12 @@ def move_files (pairs: list[tuple[LectureRecording, Course or None]], dest_folde
     """
     for pair in pairs:
         if pair[1] is None:
+            if pair[0].matching_error is not None:
+                logging.error(
+                    f'Leaving {pair[0].filepath} in the watch folder because its schedule match is ambiguous: '
+                    f'{pair[0].matching_error}'
+                )
+                continue
             move_unmatched_video(pair[0], dest_folder)
         else:
             new_path = get_new_filepath(pair[0], pair[1], dest_folder)
@@ -303,17 +737,33 @@ def upload_files (pairs: list[tuple[LectureRecording, Course or None]], dest_fol
         return
     for pair in pairs:
         if pair[1] is not None:
+            if len(pair[1].hosts) == 0:
+                logging.error(f"Cannot upload {pair[0]} because the matching course has no valid instructors. Leaving the source file in place for review.")
+                continue
+
+            new_path = get_new_filepath(pair[0], pair[1], dest_folder)
+            new_name = os.path.basename(new_path).replace('.mp4', '')
+            upload_succeeded = True
+
             for i, insr in enumerate(pair[1].hosts):
                 try:
-                    new_path = get_new_filepath(pair[0], pair[1], dest_folder)
-                    new_name = os.path.basename(new_path).replace('.mp4', '')
                     upload_video(pair[0], pair[1], client, new_name, i)
-                    logging.info(f'Sucessfully uploaded: {pair[0]}. Now moving')
+                    logging.info(f'Successfully uploaded {pair[0]} for {insr}')
                 except Exception as e:
-                    logging.error(f'Error while uploading and moving {pair[0]}. {e}')
+                    logging.error(f'Error while uploading {pair[0]} for {insr}. {e}')
+                    upload_succeeded = False
+                    break
 
-                move_video(pair[0], new_path)
-                logging.info(f'Sucessfully moved: {pair[0]}')
+            if not upload_succeeded:
+                continue
+
+            move_video(pair[0], new_path)
+            logging.info(f'Successfully moved: {pair[0]}')
+        elif pair[0].matching_error is not None:
+            logging.error(
+                f'Leaving {pair[0].filepath} in the watch folder because its schedule match is ambiguous: '
+                f'{pair[0].matching_error}'
+            )
         else:
             move_unmatched_video(pair[0], dest_folder)
 
@@ -344,7 +794,120 @@ def process_existing_files(courses: list[Course], watch_path, dest_path, mode, w
     except Exception as e:
         logging.error(f'Error occurred while reaping files: {e}')
 
+
+def _has_physical_timed_meeting(course: Course) -> bool:
+    return any(
+        meeting.room_number is not None and meeting.start_time is not None and bool(meeting.days)
+        for meeting in course.meetings
+    )
+
+
+def schedule_blocking_messages(
+    courses: list[Course],
+    require_upload_hosts: bool = True,
+) -> list[str]:
+    """Return row problems that must stop operational processing."""
+    messages = [
+        f'{_course_label(course)}: {error}'
+        for course in courses
+        for error in course.validation_errors
+    ]
+    if require_upload_hosts:
+        messages.extend(
+            f'{_course_label(course)} has a physical timed meeting but no valid upload host.'
+            for course in courses
+            if not course.hosts and _has_physical_timed_meeting(course)
+        )
+    return messages
+
+
+def validate_schedule_file(excel_path: str) -> int:
+    """Print a read-only schedule preflight summary."""
+    try:
+        courses = read_courses(excel_path, log_validation=False)
+    except (OSError, ValueError, ScheduleFormatError) as error:
+        print(f'Schedule validation failed: {error}')
+        return 2
+
+    timed_meetings = sum(
+        meeting.room_number is not None and meeting.start_time is not None and bool(meeting.days)
+        for course in courses
+        for meeting in course.meetings
+    )
+    hostless_courses = [course for course in courses if not course.hosts]
+    active_physical_hostless_courses = [
+        course for course in hostless_courses
+        if _has_physical_timed_meeting(course)
+    ]
+    import_errors = [
+        (course, error)
+        for course in courses
+        for error in course.validation_errors
+    ]
+    issues = validate_courses(courses)
+
+    print(f'Schedule: {os.path.abspath(excel_path)}')
+    print(f'Courses: {len(courses)}')
+    print(f'Physical timed meeting segments: {timed_meetings}')
+    print(f'Courses without a valid upload host: {len(hostless_courses)}')
+    print(f'Active physical courses blocked by a missing upload host: {len(active_physical_hostless_courses)}')
+    print(f'Invalid room-to-meeting mappings: {len(import_errors)}')
+    print(f'Duplicate physical slots: {len(issues)}')
+    for course, error in import_errors:
+        print(f'ERROR: {_course_label(course)}: {error}')
+    for course in active_physical_hostless_courses:
+        print(
+            f'ERROR: {_course_label(course)} has a physical timed meeting but no valid upload host. '
+            'Upload mode will leave its recordings in the watch folder.'
+        )
+    for issue in issues:
+        print(f'WARNING: {issue}')
+
+    if len(courses) == 0:
+        print('Schedule validation failed: the workbook has no non-empty course rows.')
+        return 2
+
+    blocker_count = len(import_errors) + len(active_physical_hostless_courses)
+    if blocker_count:
+        print(f'Schedule validation found {blocker_count} blocking row problem(s).')
+        return 1
+
+    print('Schedule validation completed. Warnings use safe matching behavior and do not block startup.')
+    return 0
+
+
+def _parse_command_line():
+    parser = argparse.ArgumentParser(description='Sort classroom recordings using an Excel course schedule.')
+    parser.add_argument(
+        '--validate-schedule',
+        nargs='?',
+        const='',
+        metavar='PATH',
+        help='check a schedule without moving or uploading files; omit PATH to use config.ini',
+    )
+    parser.add_argument(
+        '--run-once',
+        action='store_true',
+        help='process one batch and exit instead of waiting for the daily run',
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_command_line()
+    if args.validate_schedule is not None:
+        if args.validate_schedule:
+            schedule_path = args.validate_schedule
+        elif config.has_option('Paths', 'excel_file'):
+            schedule_path = os.path.normpath(config.get('Paths', 'excel_file'))
+        else:
+            print(
+                'Schedule validation failed: supply a workbook path after --validate-schedule '
+                "or set Paths.excel_file in config.ini."
+            )
+            raise SystemExit(2)
+        raise SystemExit(validate_schedule_file(schedule_path))
+
     WATCH_FOLDER = os.path.normpath(config.get('Paths', 'watch_folder'))
     WATCH_FOLDER = os.path.abspath(WATCH_FOLDER)
     DEST_FOLDER = os.path.normpath(config.get('Paths', 'destination_folder'))
@@ -374,6 +937,21 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(smtp_handler)
 
     courses = read_courses(EXCEL_FILE_PATH)
+    schedule_blockers = schedule_blocking_messages(
+        courses,
+        require_upload_hosts=MODE.casefold() == 'upload',
+    )
+    if schedule_blockers:
+        for blocker in schedule_blockers:
+            logging.critical(f'Schedule startup blocker: {blocker}')
+        print(f'Schedule has {len(schedule_blockers)} blocking row problem(s). See {LOG_FILE} for details.')
+        raise SystemExit(1)
+
+    if args.run_once:
+        logging.info('Running one processing pass because --run-once was supplied.')
+        process_existing_files(courses, WATCH_FOLDER, DEST_FOLDER, MODE, WEEKS_BEFORE_DELETION)
+        raise SystemExit(0)
+
     has_processed_videos = False
     
     while True:

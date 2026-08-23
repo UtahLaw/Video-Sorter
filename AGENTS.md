@@ -32,7 +32,7 @@ If those sources disagree, trust the code and tests over the older README langua
 - Run app: `.venv/bin/python video_sorter.py`
 - Build executable: `.venv/bin/pyinstaller video_sorter.spec`
 
-If `pip install -r requirements.txt` behaves strangely, check the file encoding first. The current `requirements.txt` is UTF-16LE.
+`requirements.txt` is UTF-8. The current build stack pins a setuptools release that still provides `pkg_resources` for PyInstaller and altgraph.
 
 ## Operational Guardrails
 
@@ -56,8 +56,8 @@ If `pip install -r requirements.txt` behaves strangely, check the file encoding 
 
 ## Known Maintenance Traps
 
-- `config-EXAMPLE.ini` currently includes inline comments on value lines. Python's default `ConfigParser` treats those comments as part of the value, so copying them verbatim can break startup.
-- One pytest currently fails on macOS/Linux because it asserts a Windows-style path string inside `unit_test.py`.
+- Older versions of this repo treated inline config comments as part of the value. The parser now supports inline comments, but plain values are still easier to audit in production configs.
+- The pytest suite is currently green on macOS with `.venv/bin/python -m pytest -q`.
 - The README that came with the repo was written for an older workflow and has been refreshed, but the code still has several Windows-era assumptions worth preserving carefully.
 - The parser and spreadsheet logic are not highly defensive. Unexpected instructor formatting or renamed columns are likely to fail loudly.
 

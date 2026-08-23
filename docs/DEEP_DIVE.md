@@ -34,6 +34,8 @@ The main runtime lives in `video_sorter.py`.
 
 Important operational detail: there is no filesystem watcher. This is a polling/scheduled batch job.
 
+For a controlled batch that exits after processing and retention cleanup, run `video_sorter.py --run-once`.
+
 ## Input Contracts
 
 ### 1. `config.ini`
@@ -59,7 +61,7 @@ The app expects a real `config.ini` at the repo root. The example file shows the
   - `to_count`
   - `to_email_0...n`
 
-Sharp edge: `config-EXAMPLE.ini` uses inline comments like `mode=Upload # Upload or Move`. With the current `ConfigParser()` call, those comment fragments are read as part of the value. A copied example must remove those inline comments to work correctly.
+The runtime config parser now supports inline comments, but the example file keeps comments on their own lines so it stays easy to copy and audit.
 
 ### 2. `.env`
 
@@ -73,31 +75,38 @@ These are loaded via `python-dotenv`.
 
 ### 3. Schedule spreadsheet
 
-`read_courses()` uses `pandas.read_excel()` and expects these columns from the workbook:
+`read_courses()` uses `pandas.read_excel()`. It accepts extra columns and any column order. Known headers are matched without regard to capitalization or extra whitespace.
+
+Required columns:
 
 - `Course`
 - `Section #`
 - `Course Title`
-- `Meeting Pattern`
-- `Meetings`
 - `Instructor LAST`
-- `Room (cleaned)`
 - `Instructor`
-- `Room`
+
+The sheet also needs at least one of `Meetings` or `Meeting Pattern`, plus at least one of `Room (cleaned)` or `Room`.
 
 The code directly depends on:
 
-- `Meeting Pattern` for weekday and start-time parsing
+- `Meetings`, when present, for weekday, start-time, and date-limit parsing
+- `Meeting Pattern` as the meeting fallback
 - `Instructor LAST` for output folder/file naming
-- `Room (cleaned)` for room-based matching
+- `Room (cleaned)`, with `Room` as a fallback, for room-based matching
 - `Instructor` for parsing people and uNIDs
 - `Course` plus `Section #` for CaptureCast matching
 
-The current parsing is brittle by design:
+See [COURSE_SHEET_INPUT.md](COURSE_SHEET_INPUT.md) and [examples/course_schedule_example.xlsx](examples/course_schedule_example.xlsx) for a sanitized workbook that mirrors the current export shape.
 
-- day parsing is regex-based
-- start time is extracted from free-form text
-- instructor parsing assumes `LAST, FIRST (00123456)` formatting
+The importer handles the current registrar variations:
+
+- building-prefixed rooms such as `LAW 2100` and `GC 3700` normalize to bare room numbers
+- nonphysical values such as `CANVAS`, `ONLINE`, and `No Meeting Pattern` skip room/time matching
+- instructor role suffixes such as `[Primary Instructor]` are removed before parsing
+- semicolon-delimited meeting segments keep separate days, times, rooms, and optional date limits
+- one room applies to all meeting segments; equal room and segment counts map by order
+- unequal multi-room and segment counts generate an error and skip timed matching for the row
+- rows such as `Does Not Meet` import but skip room/time matching
 
 If the registrar/export format changes, this function is one of the first places to inspect.
 
@@ -176,10 +185,10 @@ There is a stub for `manual_format_parser()` representing filenames prefixed wit
 - section number
 - course name
 - instructor last-name display string
-- room number
-- set of meeting days
-- start time
+- list of meeting segments
 - list of instructor hosts
+
+Each `CourseMeeting` stores its room number, days, start time, optional inclusive start and end dates, and original source text. The legacy `Course.room_number`, `Course.days`, and `Course.start_time` attributes remain for older callers, but matching uses the meeting list.
 
 It also chooses a default host alphabetically for upload ownership if an explicit instructor index is not supplied.
 
@@ -205,8 +214,11 @@ Timed recordings are matched by:
 1. room equality
 2. weekday membership
 3. start time within `RECORDING_START_TOLERANCE`
+4. an optional single-date or date-range limit from `Meetings`
 
-The comparison ignores the actual calendar date for time-window math and instead compares both times against a dummy date.
+The time tolerance comparison ignores the calendar date for its arithmetic. The meeting date check uses the actual recording date.
+
+The matcher ranks candidates by absolute minute distance from the recording time and only considers the nearest scheduled start inside the tolerance window. Equally near candidates with the same nonempty upload-host set use stable course and section order and log a warning. Candidates with different or missing hosts are ambiguous. The app leaves those files in the watch folder instead of moving or uploading them.
 
 ### Untimed recordings
 
@@ -214,6 +226,7 @@ Untimed recordings are matched by:
 
 1. `course_code + " " + course_number`
 2. section number
+3. explicit meeting date limits, when the course has them
 
 This is mainly for CaptureCast.
 
@@ -277,28 +290,50 @@ The repo has a meaningful pytest suite in `unit_test.py`. It covers:
 - full `process_existing_files()` behavior
 - reaper behavior
 
-Local verification on April 21, 2026:
+Local verification on August 23, 2026:
 
 - command run: `.venv/bin/python -m pytest -q`
-- result: `17 passed, 1 failed`
+- result: `45 passed`
 
-The one failing test is platform-specific:
+The suite includes the current header, room, instructor-role, multi-meeting, date-limit, and duplicate-slot cases.
 
-- `unit_test.py::TestSorter::test_matched_video_moving_extron_absolute_path`
-- it asserts a Windows-style path string with backslashes inside `os.path.join(...)`
-- on macOS/Linux, the destination file exists at the POSIX path, but not at the mixed Windows literal used by the test
+## Schedule preflight
 
-So the current codebase is close to green, but not fully cross-platform in test expectations.
+Run this read-only check before changing the configured workbook:
+
+```bash
+.venv/bin/python video_sorter.py --validate-schedule /path/to/course_schedule.xlsx
+```
+
+It prints course, physical timed-meeting, missing-host, invalid room-mapping, and duplicate-slot counts. Unreadable workbooks, bad schemas, and empty schedules return exit code 2. Invalid room-to-meeting mappings and active physical courses without valid upload hosts return exit code 1. Duplicate slots remain warnings because the matcher handles them safely.
+
+Normal processing enforces the same row blockers before touching a recording. Invalid room mappings stop Move and Upload modes. A physical timed course without a valid host stops Upload mode.
+
+## Packaging
+
+Use Python 3.11 for the current dependency set. `requirements.txt` is UTF-8 and pins `setuptools==79.0.1`; PyInstaller 6.2.0 and altgraph 0.17.4 still import `pkg_resources`, which newer setuptools releases removed.
+
+Build with:
+
+```bash
+.venv/bin/python -m ensurepip --upgrade
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m PyInstaller --clean --noconfirm video_sorter.spec
+```
+
+The spec creates a one-directory bundle at `dist/video_sorter/`. Copy the whole directory, including `_internal`. PyInstaller builds for the current operating system and CPU architecture, so create the production Windows executable on Windows rather than copying a macOS build.
+
+The build does not contain `config.ini`, `.env`, or a schedule workbook. The executable reads those files relative to its working directory. A Windows service or scheduled task therefore needs its working directory set to the deployment folder.
 
 ## Current Sharp Edges
 
 These are not necessarily production bugs, but they are the main maintenance hotspots.
 
-- `requirements.txt` is encoded as UTF-16LE, which can surprise tools and diffs.
+- The build stack currently depends on the `setuptools==79.0.1` compatibility pin for `pkg_resources`.
 - `config-EXAMPLE.ini` is not safely copy-pasteable because of inline value comments.
 - The app reads config at import time, which makes code reuse and isolated testing more awkward.
-- `read_courses()` is not defensive against unexpected instructor formatting.
-- The main process is a forever loop with time-based polling, not a service wrapper or CLI with subcommands.
+- Instructor names still need the `LAST, FIRST (00123456)` core format after optional bracketed role suffixes.
+- The default process is a forever loop with time-based polling. The CLI has validation and one-pass modes but no service wrapper.
 - The repo still reflects a Windows-first operational history even though development can happen on macOS/Linux.
 
 ## Recommended Mental Model For Future Work
