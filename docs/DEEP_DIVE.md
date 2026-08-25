@@ -273,7 +273,7 @@ The repository includes a minimal custom client because the author notes that th
 
 Operational nuance: upload ownership is assigned per host. In `upload_files()`, the script loops through each course host and performs an upload before moving the file.
 
-The custom client forces `format=1` on both API and file-upload URLs, including upload URLs returned by Kaltura, so successful upload responses use JSON. It URL-encodes query values and applies bounded connect/read timeouts. Failures identify the upload stage, HTTP status, content type, sanitized endpoint, and response size without logging session tokens or query parameters.
+The custom client forces `format=1` on both API and file-upload URLs, including upload URLs returned by Kaltura. Kaltura's upload endpoint can acknowledge accepted bytes with HTTP 202 and an empty body; in that case the client polls `uploadToken.get` and continues only after the token reaches full-upload status. It URL-encodes query values and applies bounded connect/read timeouts. Failures identify the upload stage, HTTP status, content type, sanitized endpoint, and response size without logging session tokens or query parameters.
 
 ## Retention / Reaper
 
@@ -295,7 +295,7 @@ The repo has a meaningful pytest suite in `unit_test.py`. It covers:
 Local verification on August 25, 2026:
 
 - command run: `.venv/bin/python -m pytest -q`
-- result: `47 passed`
+- result: `49 passed`
 
 The suite includes the current header, room, instructor-role, multi-meeting, date-limit, and duplicate-slot cases.
 

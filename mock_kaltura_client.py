@@ -5,6 +5,7 @@ what we need it to do. Ideally, if the client library is fixed it won't
 take much to migrate scripts to use it.
 '''
 
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
@@ -91,6 +92,8 @@ class KalturaUser:
 class KalturaClient:
     JSON_TIMEOUT = (15, 60)
     UPLOAD_TIMEOUT = (30, 300)
+    UPLOAD_STATUS_POLL_ATTEMPTS = 15
+    UPLOAD_STATUS_POLL_INTERVAL = 2
 
     @staticmethod
     def kurl (path, **kwargs):
@@ -179,6 +182,20 @@ class KalturaClient:
                 f'{operation} failed before Kaltura returned a response '
                 f'({type(exc).__name__}, endpoint {self._safe_endpoint(url)})'
             ) from exc
+
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise KalturaApiError(
+                f'{operation} failed ({self._response_details(response)})'
+            ) from exc
+
+        if (
+            getattr(response, 'status_code', None) in (202, 204)
+            and not getattr(response, 'content', b'')
+        ):
+            return None
+
         return self._parse_response(response, operation)
 
     def getRequestData(self, data=None) -> dict:
@@ -219,6 +236,31 @@ class KalturaClient:
             if token.uploadUrl:
                 self.client.upload_urls[token.id] = token.uploadUrl
             return token
+
+        def get(self, uploadTokenId):
+            res = self.client.post_json(
+                'uploadtoken/action/get',
+                self.client.getRequestData({'uploadTokenId': uploadTokenId}),
+                operation='verify accepted upload',
+            )
+            return KalturaUploadToken.fromJsonResponse(res)
+
+        def waitForFullUpload(self, uploadTokenId):
+            last_status = None
+            for attempt in range(self.client.UPLOAD_STATUS_POLL_ATTEMPTS):
+                token = self.get(uploadTokenId)
+                last_status = token.status
+                if token.status == 2:
+                    return token
+                if token.status in (4, 5):
+                    break
+                if attempt < self.client.UPLOAD_STATUS_POLL_ATTEMPTS - 1:
+                    time.sleep(self.client.UPLOAD_STATUS_POLL_INTERVAL)
+
+            raise KalturaApiError(
+                'upload file bytes was accepted, but the upload token did not '
+                f'reach full-upload status (last token status {last_status})'
+            )
         
         def upload (self, uploadTokenId, fileData, resume, finalChunk, resumeAt):
             upload_url = self.client.upload_urls.get(uploadTokenId, None)
@@ -236,6 +278,8 @@ class KalturaClient:
             })
 
             res = self.client.post_upload(url, fileData, operation='upload file bytes')
+            if res is None:
+                return self.waitForFullUpload(uploadTokenId)
             return KalturaUploadToken.fromJsonResponse(res)
         
     class MediaService(KalturaServiceBase):

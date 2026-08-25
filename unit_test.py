@@ -915,6 +915,94 @@ class TestKalturaClient:
         assert 'endpoint https://upload.example.com/api_v3/service/uploadtoken/action/upload' in message
         assert 'secret-session-value' not in message
 
+    def test_empty_accepted_upload_is_verified_by_token_status(self, monkeypatch):
+        client = self.make_client()
+        client.upload_urls['upload-token-1'] = (
+            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+        )
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, url, payload=None, status_code=200, content=b'{}'):
+                self.url = url
+                self.payload = payload
+                self.status_code = status_code
+                self.content = content
+                self.headers = {'Content-Type': 'application/json'}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                if self.payload is None:
+                    raise ValueError('empty response')
+                return self.payload
+
+        def fake_post(url, json=None, files=None, timeout=None):
+            calls.append({'url': url, 'json': json, 'files': files, 'timeout': timeout})
+            if files:
+                return FakeResponse(
+                    url,
+                    status_code=202,
+                    content=b'',
+                )
+            return FakeResponse(url, {
+                'id': 'upload-token-1',
+                'status': 2,
+            })
+
+        monkeypatch.setattr('mock_kaltura_client.requests.post', fake_post)
+
+        result = client.uploadToken.upload(
+            'upload-token-1', io.BytesIO(b'test'), False, True, 0
+        )
+
+        assert result.id == 'upload-token-1'
+        assert result.status == 2
+        assert len(calls) == 2
+        assert 'uploadtoken/action/get' in calls[1]['url']
+        assert calls[1]['timeout'] == KalturaClient.JSON_TIMEOUT
+
+    def test_empty_accepted_upload_must_reach_full_status(self, monkeypatch):
+        client = self.make_client()
+        client.UPLOAD_STATUS_POLL_ATTEMPTS = 2
+        client.UPLOAD_STATUS_POLL_INTERVAL = 0
+        client.upload_urls['upload-token-1'] = (
+            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+        )
+
+        class FakeResponse:
+            headers = {'Content-Type': 'application/json'}
+
+            def __init__(self, url, payload=None, status_code=200, content=b'{}'):
+                self.url = url
+                self.payload = payload
+                self.status_code = status_code
+                self.content = content
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                if self.payload is None:
+                    raise ValueError('empty response')
+                return self.payload
+
+        def fake_post(url, json=None, files=None, timeout=None):
+            if files:
+                return FakeResponse(url, status_code=202, content=b'')
+            return FakeResponse(url, {
+                'id': 'upload-token-1',
+                'status': 1,
+            })
+
+        monkeypatch.setattr('mock_kaltura_client.requests.post', fake_post)
+
+        with pytest.raises(KalturaApiError, match='last token status 1'):
+            client.uploadToken.upload(
+                'upload-token-1', io.BytesIO(b'test'), False, True, 0
+            )
+
     def test_network_error_identifies_stage_without_leaking_query(self, monkeypatch):
         client = self.make_client()
         client.sessionData.ks = 'secret-session-value'
