@@ -880,7 +880,7 @@ class TestKalturaClient:
         assert 'upload.example.com' not in calls[1]['url']
         assert 'format=1' in calls[1]['url']
         assert 'uploadTokenId=upload-token-1' in calls[1]['url']
-        assert calls[1]['timeout'] == KalturaClient.UPLOAD_TIMEOUT
+        assert calls[1]['timeout'] == (180, 900)
 
     def test_non_json_upload_error_identifies_stage_without_leaking_query(self, monkeypatch):
         client = self.make_client()

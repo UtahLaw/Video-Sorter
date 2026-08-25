@@ -91,7 +91,10 @@ class KalturaUser:
 
 class KalturaClient:
     JSON_TIMEOUT = (15, 60)
-    UPLOAD_TIMEOUT = (30, 300)
+    # The production Kaltura upload route can spend about a minute negotiating
+    # before returning a response for a large classroom recording. Keep this
+    # bounded, but well above the proven 63-second production upload time.
+    UPLOAD_TIMEOUT = (180, 900)
     UPLOAD_STATUS_POLL_ATTEMPTS = 15
     UPLOAD_STATUS_POLL_INTERVAL = 2
 
