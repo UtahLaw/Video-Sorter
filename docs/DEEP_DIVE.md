@@ -273,7 +273,7 @@ The repository includes a minimal custom client because the author notes that th
 
 Operational nuance: upload ownership is assigned per host. In `upload_files()`, the script loops through each course host and performs an upload before moving the file.
 
-The custom client forces `format=1` on both API and file-upload URLs, including upload URLs returned by Kaltura. Kaltura's upload endpoint can acknowledge accepted bytes with HTTP 202 and an empty body; in that case the client polls `uploadToken.get` and continues only after the token reaches full-upload status. It URL-encodes query values and applies bounded connect/read timeouts. Failures identify the upload stage, HTTP status, content type, sanitized endpoint, and response size without logging session tokens or query parameters.
+The custom client treats the `uploadUrl` returned with a token as a data-center domain and normalizes it to `/api_v3/service/uploadtoken/action/upload`, matching Kaltura's generated client behavior. It forces `format=1` on both API and file-upload calls. Kaltura's upload endpoint can acknowledge accepted bytes with HTTP 202 and an empty body; in that case the client polls `uploadToken.get` and continues only after the token reaches full-upload status. It URL-encodes query values and applies bounded connect/read timeouts. Failures identify the upload stage, HTTP status, content type, sanitized endpoint, and response size without logging session tokens or query parameters.
 
 ## Retention / Reaper
 

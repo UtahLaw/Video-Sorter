@@ -111,6 +111,20 @@ class KalturaClient:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     @staticmethod
+    def _upload_action_url(upload_url: str) -> str:
+        """Use Kaltura's returned upload domain with the upload-token action path."""
+        parts = urlsplit(upload_url or '')
+        if not parts.scheme or not parts.netloc:
+            parts = urlsplit('https://www.kaltura.com')
+        return urlunsplit((
+            parts.scheme,
+            parts.netloc,
+            '/api_v3/service/uploadtoken/action/upload',
+            parts.query,
+            '',
+        ))
+
+    @staticmethod
     def _safe_endpoint(url: str) -> str:
         endpoint_parts = urlsplit(url or '')
         endpoint = urlunsplit((endpoint_parts.scheme, endpoint_parts.netloc, endpoint_parts.path, '', ''))
@@ -263,9 +277,9 @@ class KalturaClient:
             )
         
         def upload (self, uploadTokenId, fileData, resume, finalChunk, resumeAt):
-            upload_url = self.client.upload_urls.get(uploadTokenId, None)
-            if not upload_url:
-                upload_url = 'https://www.kaltura.com/api_v3/service/uploadtoken/action/upload'
+            upload_url = self.client._upload_action_url(
+                self.client.upload_urls.get(uploadTokenId, '')
+            )
 
             url = self.client._with_query_params(upload_url, {
                 'format': 1,

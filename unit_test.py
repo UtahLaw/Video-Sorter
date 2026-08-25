@@ -860,7 +860,7 @@ class TestKalturaClient:
             if 'uploadtoken/action/add' in url:
                 return FakeResponse({
                     'id': 'upload-token-1',
-                    'uploadUrl': 'https://upload.example.com/api_v3/service/uploadtoken/action/upload',
+                    'uploadUrl': 'https://upload.example.com',
                 })
 
             return FakeResponse({
@@ -874,7 +874,9 @@ class TestKalturaClient:
         result = client.uploadToken.upload(token.id, io.BytesIO(b'test'), False, True, 0)
 
         assert result.id == 'upload-token-1'
-        assert calls[1]['url'].startswith('https://upload.example.com/api_v3/service/uploadtoken/action/upload')
+        assert calls[1]['url'].startswith(
+            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+        )
         assert 'format=1' in calls[1]['url']
         assert 'uploadTokenId=upload-token-1' in calls[1]['url']
         assert calls[1]['timeout'] == KalturaClient.UPLOAD_TIMEOUT
