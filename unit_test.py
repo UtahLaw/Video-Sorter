@@ -841,7 +841,7 @@ class TestKalturaClient:
                 'toDict': lambda self: {'name': 'Demo', 'mediaType': 1},
             })())
 
-    def test_upload_uses_returned_upload_url_when_available(self, monkeypatch):
+    def test_upload_uses_primary_action_endpoint_when_alternate_host_is_returned(self, monkeypatch):
         client = self.make_client()
         calls = []
 
@@ -875,8 +875,9 @@ class TestKalturaClient:
 
         assert result.id == 'upload-token-1'
         assert calls[1]['url'].startswith(
-            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+            'https://www.kaltura.com/api_v3/service/uploadtoken/action/upload'
         )
+        assert 'upload.example.com' not in calls[1]['url']
         assert 'format=1' in calls[1]['url']
         assert 'uploadTokenId=upload-token-1' in calls[1]['url']
         assert calls[1]['timeout'] == KalturaClient.UPLOAD_TIMEOUT
@@ -914,7 +915,7 @@ class TestKalturaClient:
         assert 'upload file bytes failed' in message
         assert 'HTTP 200' in message
         assert 'content-type text/html; charset=UTF-8' in message
-        assert 'endpoint https://upload.example.com/api_v3/service/uploadtoken/action/upload' in message
+        assert 'endpoint https://www.kaltura.com/api_v3/service/uploadtoken/action/upload' in message
         assert 'secret-session-value' not in message
 
     def test_empty_accepted_upload_is_verified_by_token_status(self, monkeypatch):
@@ -1023,5 +1024,5 @@ class TestKalturaClient:
         message = str(exc_info.value)
         assert 'upload file bytes failed before Kaltura returned a response' in message
         assert 'Timeout' in message
-        assert 'endpoint https://upload.example.com/api_v3/service/uploadtoken/action/upload' in message
+        assert 'endpoint https://www.kaltura.com/api_v3/service/uploadtoken/action/upload' in message
         assert 'secret-session-value' not in message

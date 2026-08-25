@@ -111,18 +111,15 @@ class KalturaClient:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     @staticmethod
-    def _upload_action_url(upload_url: str) -> str:
-        """Use Kaltura's returned upload domain with the upload-token action path."""
-        parts = urlsplit(upload_url or '')
-        if not parts.scheme or not parts.netloc:
-            parts = urlsplit('https://www.kaltura.com')
-        return urlunsplit((
-            parts.scheme,
-            parts.netloc,
-            '/api_v3/service/uploadtoken/action/upload',
-            parts.query,
-            '',
-        ))
+    def _upload_action_url(_upload_url: str) -> str:
+        """Use the primary upload action endpoint used by the proven legacy client.
+
+        Kaltura can return a data-center upload host such as my-upload.kaltura.com,
+        but that host acknowledged production uploads without advancing the token
+        from PENDING. The earlier working sorter deliberately ignored uploadUrl and
+        posted to the primary API action endpoint instead.
+        """
+        return 'https://www.kaltura.com/api_v3/service/uploadtoken/action/upload'
 
     @staticmethod
     def _safe_endpoint(url: str) -> str:
