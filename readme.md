@@ -81,9 +81,9 @@ The tests depend on:
 - `test_courses.xlsx`
 - the folder structure configured by `[Paths].test_folder`
 
-Status verified locally on August 23, 2026:
+Status verified locally on August 25, 2026:
 
-- 45 tests passed
+- 47 tests passed
 
 ## Build To Executable
 

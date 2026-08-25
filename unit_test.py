@@ -4,6 +4,7 @@ import io
 import tempfile
 import pandas as pd
 import pytest
+import requests
 config = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
 config.read('config.ini')
 
@@ -854,12 +855,12 @@ class TestKalturaClient:
             def json(self):
                 return self.payload
 
-        def fake_post(url, json=None, files=None):
-            calls.append({'url': url, 'json': json, 'files': files})
+        def fake_post(url, json=None, files=None, timeout=None):
+            calls.append({'url': url, 'json': json, 'files': files, 'timeout': timeout})
             if 'uploadtoken/action/add' in url:
                 return FakeResponse({
                     'id': 'upload-token-1',
-                    'uploadUrl': 'https://upload.example.com/api_v3/service/uploadtoken/action/upload?format=1',
+                    'uploadUrl': 'https://upload.example.com/api_v3/service/uploadtoken/action/upload',
                 })
 
             return FakeResponse({
@@ -874,4 +875,63 @@ class TestKalturaClient:
 
         assert result.id == 'upload-token-1'
         assert calls[1]['url'].startswith('https://upload.example.com/api_v3/service/uploadtoken/action/upload')
+        assert 'format=1' in calls[1]['url']
         assert 'uploadTokenId=upload-token-1' in calls[1]['url']
+        assert calls[1]['timeout'] == KalturaClient.UPLOAD_TIMEOUT
+
+    def test_non_json_upload_error_identifies_stage_without_leaking_query(self, monkeypatch):
+        client = self.make_client()
+        client.sessionData.ks = 'secret-session-value'
+        client.upload_urls['upload-token-1'] = (
+            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+        )
+
+        class FakeResponse:
+            status_code = 200
+            headers = {'Content-Type': 'text/html; charset=UTF-8'}
+            content = b'<html>temporary proxy response</html>'
+
+            def __init__(self, url):
+                self.url = url
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                raise ValueError('not JSON')
+
+        def fake_post(url, json=None, files=None, timeout=None):
+            return FakeResponse(url)
+
+        monkeypatch.setattr('mock_kaltura_client.requests.post', fake_post)
+
+        with pytest.raises(KalturaApiError) as exc_info:
+            client.uploadToken.upload('upload-token-1', io.BytesIO(b'test'), False, True, 0)
+
+        message = str(exc_info.value)
+        assert 'upload file bytes failed' in message
+        assert 'HTTP 200' in message
+        assert 'content-type text/html; charset=UTF-8' in message
+        assert 'endpoint https://upload.example.com/api_v3/service/uploadtoken/action/upload' in message
+        assert 'secret-session-value' not in message
+
+    def test_network_error_identifies_stage_without_leaking_query(self, monkeypatch):
+        client = self.make_client()
+        client.sessionData.ks = 'secret-session-value'
+        client.upload_urls['upload-token-1'] = (
+            'https://upload.example.com/api_v3/service/uploadtoken/action/upload'
+        )
+
+        def fake_post(url, json=None, files=None, timeout=None):
+            raise requests.Timeout('request URL includes secret-session-value')
+
+        monkeypatch.setattr('mock_kaltura_client.requests.post', fake_post)
+
+        with pytest.raises(KalturaApiError) as exc_info:
+            client.uploadToken.upload('upload-token-1', io.BytesIO(b'test'), False, True, 0)
+
+        message = str(exc_info.value)
+        assert 'upload file bytes failed before Kaltura returned a response' in message
+        assert 'Timeout' in message
+        assert 'endpoint https://upload.example.com/api_v3/service/uploadtoken/action/upload' in message
+        assert 'secret-session-value' not in message

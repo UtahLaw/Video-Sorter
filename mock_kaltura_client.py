@@ -5,6 +5,8 @@ what we need it to do. Ideally, if the client library is fixed it won't
 take much to migrate scripts to use it.
 '''
 
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 import requests
 
 class KalturaApiError(RuntimeError):
@@ -87,39 +89,97 @@ class KalturaUser:
         return user
 
 class KalturaClient:
+    JSON_TIMEOUT = (15, 60)
+    UPLOAD_TIMEOUT = (30, 300)
+
     @staticmethod
     def kurl (path, **kwargs):
-        query = '?format=1'
-        for key, value in kwargs.items():
-            query += f'&{key}={value}'
-        url = f'https://www.kaltura.com/api_v3/service/{path}{query}'
-        return url
+        return KalturaClient._with_query_params(
+            f'https://www.kaltura.com/api_v3/service/{path}',
+            {'format': 1, **kwargs},
+        )
+
+    @staticmethod
+    def _with_query_params(url: str, params: dict) -> str:
+        """Merge encoded parameters into a Kaltura URL without duplicating keys."""
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.update({key: str(value) for key, value in params.items()})
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    @staticmethod
+    def _safe_endpoint(url: str) -> str:
+        endpoint_parts = urlsplit(url or '')
+        endpoint = urlunsplit((endpoint_parts.scheme, endpoint_parts.netloc, endpoint_parts.path, '', ''))
+        return endpoint or 'unknown endpoint'
+
+    @staticmethod
+    def _response_details(response) -> str:
+        status = getattr(response, 'status_code', 'unknown')
+        headers = getattr(response, 'headers', {}) or {}
+        content_type = headers.get('Content-Type', 'unknown')
+        endpoint = KalturaClient._safe_endpoint(getattr(response, 'url', '') or '')
+
+        content = getattr(response, 'content', b'')
+        try:
+            response_bytes = len(content)
+        except TypeError:
+            response_bytes = 'unknown'
+
+        return (
+            f'HTTP {status}, content-type {content_type}, '
+            f'endpoint {endpoint}, response bytes {response_bytes}'
+        )
     
     @staticmethod
-    def _parse_response(response):
-        response.raise_for_status()
+    def _parse_response(response, operation='Kaltura API request'):
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise KalturaApiError(
+                f'{operation} failed ({KalturaClient._response_details(response)})'
+            ) from exc
 
         try:
             payload = response.json()
         except ValueError as exc:
-            raise KalturaApiError("Kaltura returned a non-JSON response") from exc
+            raise KalturaApiError(
+                f'{operation} failed: Kaltura returned a non-JSON response '
+                f'({KalturaClient._response_details(response)})'
+            ) from exc
 
         if isinstance(payload, dict) and payload.get('objectType') == 'KalturaAPIException':
             code = payload.get('code', 'UNKNOWN')
             message = payload.get('message', 'Unknown Kaltura API error')
-            raise KalturaApiError(f"{code}: {message}")
+            raise KalturaApiError(f'{operation} failed: {code}: {message}')
 
         return payload
 
-    def post_json(self, path: str, data=None, **kwargs):
-        response = requests.post(self.kurl(path, **kwargs), json=data)
-        return self._parse_response(response)
+    def post_json(self, path: str, data=None, operation=None, **kwargs):
+        operation = operation or path
+        url = self.kurl(path, **kwargs)
+        try:
+            response = requests.post(url, json=data, timeout=self.JSON_TIMEOUT)
+        except requests.RequestException as exc:
+            raise KalturaApiError(
+                f'{operation} failed before Kaltura returned a response '
+                f'({type(exc).__name__}, endpoint {self._safe_endpoint(url)})'
+            ) from exc
+        return self._parse_response(response, operation)
 
-    def post_upload(self, url: str, fileData):
-        response = requests.post(url, files={
-            'fileData': fileData
-        })
-        return self._parse_response(response)
+    def post_upload(self, url: str, fileData, operation='upload file bytes'):
+        try:
+            response = requests.post(
+                url,
+                files={'fileData': fileData},
+                timeout=self.UPLOAD_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise KalturaApiError(
+                f'{operation} failed before Kaltura returned a response '
+                f'({type(exc).__name__}, endpoint {self._safe_endpoint(url)})'
+            ) from exc
+        return self._parse_response(response, operation)
 
     def getRequestData(self, data=None) -> dict:
             if data is None:
@@ -135,7 +195,7 @@ class KalturaClient:
             res = self.client.post_json('session/action/startWidgetSession', {
                 'expiry': expiry,
                 'widgetId': widgetId
-            })
+            }, operation='start widget session')
             self.client.sessionData = KalturaClient.SessionData(res)
             return self.client.sessionData
 
@@ -144,70 +204,65 @@ class KalturaClient:
             res = self.client.post_json('apptoken/action/startSession', self.client.getRequestData({
                 'id': id,
                 'tokenHash': tokenHash
-            }))
+            }), operation='start app-token session')
             self.client.sessionData = KalturaClient.SessionData(res)
             return self.client.sessionData
         
     class UploadTokenService(KalturaServiceBase):
         def add (self, uploadToken):
-            res = self.client.post_json('uploadtoken/action/add', self.client.getRequestData())
+            res = self.client.post_json(
+                'uploadtoken/action/add',
+                self.client.getRequestData(),
+                operation='create upload token',
+            )
             token = KalturaUploadToken.fromJsonResponse(res)
             if token.uploadUrl:
                 self.client.upload_urls[token.id] = token.uploadUrl
             return token
         
         def upload (self, uploadTokenId, fileData, resume, finalChunk, resumeAt):
-            query = (
-                f'uploadTokenId={uploadTokenId}'
-                f'&resume={"true" if resume else "false"}'
-                f'&finalChunk={"true" if finalChunk else "false"}'
-                f'&resumeAt={resumeAt}'
-                f'&ks={self.client.sessionData.ks}'
-                f'&partnerId={self.client.sessionData.partnerId}'
-            )
-
             upload_url = self.client.upload_urls.get(uploadTokenId, None)
-            if upload_url:
-                separator = '&' if '?' in upload_url else '?'
-                url = f'{upload_url}{separator}{query}'
-            else:
-                url = KalturaClient.kurl('uploadtoken/action/upload', **{
-                    'uploadTokenId': uploadTokenId,
-                    'resume': 'true' if resume else 'false',
-                    'finalChunk': 'true' if finalChunk else 'false',
-                    'resumeAt': resumeAt,
-                    'ks': self.client.sessionData.ks,
-                    'partnerId': self.client.sessionData.partnerId,
-                })
+            if not upload_url:
+                upload_url = 'https://www.kaltura.com/api_v3/service/uploadtoken/action/upload'
 
-            res = self.client.post_upload(url, fileData)
+            url = self.client._with_query_params(upload_url, {
+                'format': 1,
+                'uploadTokenId': uploadTokenId,
+                'resume': 'true' if resume else 'false',
+                'finalChunk': 'true' if finalChunk else 'false',
+                'resumeAt': resumeAt,
+                'ks': self.client.sessionData.ks,
+                'partnerId': self.client.sessionData.partnerId,
+            })
+
+            res = self.client.post_upload(url, fileData, operation='upload file bytes')
             return KalturaUploadToken.fromJsonResponse(res)
         
     class MediaService(KalturaServiceBase):
         def add (self, mediaEntry: KalturaMediaEntry):
             res = self.client.post_json('media/action/add', self.client.getRequestData({
                 'entry': mediaEntry.toDict()
-            }))
+            }), operation='create media entry')
             return KalturaMediaEntry.fromJsonResponse(res)
         
         def addContent(self, entry_id, resource):
             res = self.client.post_json('media/action/addContent', self.client.getRequestData({
                 'entryId': entry_id,
                 'resource': resource.toDict()
-            }))
+            }), operation='attach uploaded content')
             return res
         
     class UserService(KalturaServiceBase):
         def getByLoginId(self, loginId) -> KalturaUser:
             res = self.client.post_json('user/action/getByLoginId', self.client.getRequestData({
                 'loginId': loginId
-            }))
+            }), operation='look up Kaltura user by login ID')
             return KalturaUser.fromJsonResponse(res)
         
         def get(self, userId) -> KalturaUser:
             res = self.client.post_json('user/action/get', self.client.getRequestData({
                 'userId': userId
-            }))
+            }), operation='look up Kaltura user')
             return KalturaUser.fromJsonResponse(res)
     
     class SessionData:
